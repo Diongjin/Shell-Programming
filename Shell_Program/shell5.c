@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#define CMD_BUF_SIZE 4096
 
 int getargs(char *cmd, char **argv);
 
@@ -172,24 +173,30 @@ int shell_rm(char **argv) {
     return 0;
 }
 
-/* mv: mv src dst (rename 기반) */
+/* mv: mv src dst (rename 시스템 콜 기반) */
 int shell_mv(char **argv) {
+    // 인자 부족 체크
     if (argv[1] == NULL || argv[2] == NULL) {
         fprintf(stderr, "mv: usage: mv src dst\n");
         return 1;
     }
+
+    // rename 실행
     if (rename(argv[1], argv[2]) < 0) {
         perror("mv");
         return 1;
     }
+
     return 0;
 }
 
 /* cat: cat [file] (없으면 stdin) */
 int shell_cat(char **argv) {
     int fd;
+    
+    // 인자가 없으면 표준 입력, 있으면 파일 열기
     if (argv[1] == NULL) {
-        fd = STDIN_FILENO;   // 인자 없으면 표준 입력 사용
+        fd = STDIN_FILENO;
     } else {
         fd = open(argv[1], O_RDONLY);
         if (fd < 0) {
@@ -198,51 +205,75 @@ int shell_cat(char **argv) {
         }
     }
 
-    char buf[4096];
-    ssize_t n;
-    while ((n = read(fd, buf, sizeof(buf))) > 0) {
-        if (write(STDOUT_FILENO, buf, n) != n) {
-            perror("cat: write");
-            if (fd != STDIN_FILENO) close(fd);
-            return 1;
+    char buf[CMD_BUF_SIZE];
+    ssize_t n_read;
+
+    // 파일 끝까지 읽기
+    while ((n_read = read(fd, buf, sizeof(buf))) > 0) {
+        ssize_t n_written = 0;
+        
+        // 읽은 만큼 표준 출력에 쓰기 (Partial write 대응 루프)
+        while (n_written < n_read) {
+            ssize_t ret = write(STDOUT_FILENO, buf + n_written, n_read - n_written);
+            
+            if (ret < 0) {
+                perror("cat: write");
+                if (fd != STDIN_FILENO) close(fd);
+                return 1;
+            }
+            n_written += ret;
         }
     }
-    if (n < 0) {
+
+    // 읽기 에러 체크
+    if (n_read < 0) {
         perror("cat: read");
         if (fd != STDIN_FILENO) close(fd);
         return 1;
     }
 
-    if (fd != STDIN_FILENO) close(fd);
+    // 파일 닫기 (표준 입력이 아닐 경우만)
+    if (fd != STDIN_FILENO) {
+        close(fd);
+    }
+    
     return 0;
 }
 
 /* grep: grep pattern [file] (단순 문자열 검색) */
 int shell_grep(char **argv) {
+    // 패턴 인자 체크
     if (argv[1] == NULL) {
         fprintf(stderr, "grep: usage: grep pattern [file]\n");
         return 1;
     }
 
     const char *pattern = argv[1];
-    FILE *fp = stdin;
+    FILE *fp = stdin; // 기본은 표준 입력
 
+    // 파일명이 주어졌다면 파일 열기
     if (argv[2] != NULL) {
         fp = fopen(argv[2], "r");
-        if (!fp) {
+        if (fp == NULL) {
             perror("grep");
             return 1;
         }
     }
 
-    char line[4096];
+    char line[CMD_BUF_SIZE];
+    
+    // 줄 단위로 읽어서 패턴 검사
     while (fgets(line, sizeof(line), fp) != NULL) {
         if (strstr(line, pattern) != NULL) {
             fputs(line, stdout);
         }
     }
 
-    if (fp != stdin) fclose(fp);
+    // 파일 닫기 (표준 입력이 아닐 경우만)
+    if (fp != stdin) {
+        fclose(fp);
+    }
+
     return 0;
 }
 
