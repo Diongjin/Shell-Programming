@@ -105,49 +105,100 @@ int shell_rmdir(char **argv) {
     return 0;
 }
 
-/* ln: ln old new (하드 링크) */
+/* ln: ln old new (하드 링크 생성) */
 int shell_ln(char **argv) {
+    /* 인자 2개 필수 */
     if (argv[1] == NULL || argv[2] == NULL) {
         fprintf(stderr, "ln: usage: ln old new\n");
         return 1;
     }
+
+    /* 원본 파일 존재 검사 */
+    struct stat st;
+    if (stat(argv[1], &st) < 0) {
+        perror("ln: source file not found");
+        return 1;
+    }
+
+    /* 동일 파일 체크 */
+    if (strcmp(argv[1], argv[2]) == 0) {
+        fprintf(stderr, "ln: '%s' and '%s' are the same file\n", argv[1], argv[2]);
+        return 1;
+    }
+
+    /* 하드 링크 생성 */
     if (link(argv[1], argv[2]) < 0) {
         perror("ln");
         return 1;
     }
+
     return 0;
 }
 
-/* cp: cp src dst (파일 -> 파일) */
+
+/* cp: cp src dst (파일 복사) */
 int shell_cp(char **argv) {
+    /* 인자 2개 필수 */
     if (argv[1] == NULL || argv[2] == NULL) {
         fprintf(stderr, "cp: usage: cp src dst\n");
         return 1;
     }
 
-    int fd_in  = open(argv[1], O_RDONLY);
+    const char *src = argv[1];
+    const char *dst = argv[2];
+
+    /* 원본 파일 상태 확인 (존재/디렉터리인지 검사) */
+    struct stat st;
+    if (stat(src, &st) < 0) {
+        perror("cp: source not found");
+        return 1;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "cp: '%s' is a directory (not supported)\n", src);
+        return 1;
+    }
+
+    /* 동일 파일 검사 */
+    if (strcmp(src, dst) == 0) {
+        fprintf(stderr, "cp: '%s' and '%s' are the same file\n", src, dst);
+        return 1;
+    }
+
+    /* 원본 파일 열기 */
+    int fd_in = open(src, O_RDONLY);
     if (fd_in < 0) {
         perror("cp: open src");
         return 1;
     }
 
-    int fd_out = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    /* 대상 파일 열기 (원본 권한 적용) */
+    int fd_out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 0777);
     if (fd_out < 0) {
         perror("cp: open dst");
         close(fd_in);
         return 1;
     }
 
+    /* 버퍼 기반 복사 */
     char buf[4096];
     ssize_t n;
+
     while ((n = read(fd_in, buf, sizeof(buf))) > 0) {
-        if (write(fd_out, buf, n) != n) {
-            perror("cp: write");
-            close(fd_in);
-            close(fd_out);
-            return 1;
+        ssize_t w = 0;
+        /* 부분 쓰기 방지를 위한 루프 */
+        while (w < n) {
+            ssize_t ret = write(fd_out, buf + w, n - w);
+            if (ret < 0) {
+                perror("cp: write");
+                close(fd_in);
+                close(fd_out);
+                return 1;
+            }
+            w += ret;
         }
     }
+
+    /* 읽기 에러 처리 */
     if (n < 0) {
         perror("cp: read");
         close(fd_in);
@@ -155,23 +206,48 @@ int shell_cp(char **argv) {
         return 1;
     }
 
+    /* 파일 닫기 */
     close(fd_in);
     close(fd_out);
     return 0;
 }
 
+
+
 /* rm: rm file (파일 삭제) */
 int shell_rm(char **argv) {
+    /* 인자 1개 필수 */
     if (argv[1] == NULL) {
         fprintf(stderr, "rm: path required\n");
         return 1;
     }
-    if (unlink(argv[1]) < 0) {
+
+    const char *path = argv[1];
+    struct stat st;
+
+    /* 대상 존재 여부 확인 */
+    if (stat(path, &st) < 0) {
         perror("rm");
         return 1;
     }
+
+    /* 디렉터리는 rm으로 삭제 불가 */
+    if (S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "rm: cannot remove '%s': Is a directory\n", path);
+        return 1;
+    }
+
+    /* 파일 삭제 */
+    if (unlink(path) < 0) {
+        perror("rm");
+        return 1;
+    }
+
     return 0;
 }
+
+
+
 
 /* mv: mv src dst (rename 시스템 콜 기반) */
 int shell_mv(char **argv) {
