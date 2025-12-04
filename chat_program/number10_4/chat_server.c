@@ -1,4 +1,3 @@
-// chat_server.c (파일 전송 지원 버전)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,270 +10,298 @@
 #include <sys/select.h>
 #include <locale.h>
 
-#define PORT    3490
-#define QLEN    10
-#define MAXBUF  4096
-#define MAXNAME 32
-#define MAXROOM 32
+#define PORT        3490
+#define MAX_CLIENTS 100
+#define MAXBUF      4096
+#define MAXNAME     32
+#define MAXROOM     32
 
-// fd 번호별 사용자/방 정보
-static int  registered[FD_SETSIZE];          // 0: 미등록, 1: /join 완료
-static char nicknames[FD_SETSIZE][MAXNAME];  // 닉네임
-static char rooms[FD_SETSIZE][MAXROOM];      // 방 이름
-// fd 번호별 파일 수신 상태 (이 fd로부터 앞으로 몇 바이트의 파일 데이터가 올 예정인가?)
-static long file_remain[FD_SETSIZE];         // 0이면 평상시, >0이면 파일 데이터 모드
+/* 클라이언트 상태 관리 구조체 */
+typedef struct {
+    int fd;                     // 소켓 파일 디스크립터 (-1이면 빈 슬롯)
+    char nickname[MAXNAME];     // 닉네임
+    char room[MAXROOM];         // 현재 방 이름
+    int registered;             // 0: 접속직후, 1: /join 완료
 
-void init_clients() {
-    for (int i = 0; i < FD_SETSIZE; i++) {
-        registered[i] = 0;
-        nicknames[i][0] = '\0';
-        rooms[i][0] = '\0';
-        file_remain[i] = 0;
+    /* TCP 스트림 처리를 위한 버퍼 */
+    char cmd_buf[MAXBUF];       // 명령어를 쌓아두는 버퍼
+    int cmd_len;                // 현재 버퍼에 쌓인 데이터 길이
+
+    /* 파일 전송 상태 */
+    long file_remain;           // 남은 파일 전송량 (>0 이면 파일 모드)
+} ClientContext;
+
+/* 서버 상태 관리 구조체 */
+typedef struct {
+    int listenfd;
+    ClientContext clients[MAX_CLIENTS]; // 클라이언트 배열
+    fd_set all_fds;                     // 전체 관찰 대상 fd 셋
+    int max_fd;                         // 현재 가장 큰 fd 번호
+} ServerContext;
+
+/* 전역 서버 컨텍스트 (main과 signal 핸들러 등에서 접근 가능하도록 할 수 있으나, 여기선 main 루프 내에서 처리) */
+
+/* 클라이언트 슬롯 초기화 */
+void init_client(ClientContext *c) {
+    c->fd = -1;
+    memset(c->nickname, 0, MAXNAME);
+    memset(c->room, 0, MAXROOM);
+    c->registered = 0;
+    memset(c->cmd_buf, 0, MAXBUF);
+    c->cmd_len = 0;
+    c->file_remain = 0;
+}
+
+/* 연결 종료 및 정리 */
+void disconnect_client(ServerContext *server, int idx) {
+    int fd = server->clients[idx].fd;
+    if (fd >= 0) {
+        close(fd);
+        FD_CLR(fd, &server->all_fds);
+        printf("SERVER: Client fd=%d disconnected\n", fd);
+    }
+    init_client(&server->clients[idx]);
+}
+
+/* 같은 방의 다른 클라이언트에게 메시지 전송 (브로드캐스트) */
+void broadcast_to_room(ServerContext *server, int sender_idx, const char *data, int len) {
+    ClientContext *sender = &server->clients[sender_idx];
+    
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        ClientContext *target = &server->clients[i];
+        
+        if (target->fd == -1) continue; // 빈 슬롯
+        if (!target->registered) continue; // 입장 전
+        if (strcmp(target->room, sender->room) != 0) continue; // 다른 방
+
+        // 자기 자신 및 다른 사람에게 전송 (send 실패 시 로그만)
+        if (send(target->fd, data, len, 0) == -1) {
+            perror("send broadcast");
+        }
     }
 }
 
-// /join, /msg, /file 헤더 처리
-void handle_line(int fd, fd_set *activefds, char *line) {
-    char buf[MAXBUF];
+/* 명령어 처리 로직 (/join, /msg, /file) */
+void process_command(ServerContext *server, int idx, char *line) {
+    ClientContext *cli = &server->clients[idx];
+    int fd = cli->fd;
+    char response[MAXBUF];
 
-    // 줄 끝의 \r\n 제거
-    size_t len = strlen(line);
-    while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) {
-        line[--len] = '\0';
-    }
-    if (len == 0) return;
-
-    // /join <name> <room>
+    // 1. /join <name> <room>
     if (strncmp(line, "/join", 5) == 0) {
         char name[MAXNAME], room[MAXROOM];
         if (sscanf(line, "/join %31s %31s", name, room) != 2) {
-            const char *err = "ERR Usage: /join <name> <room>\n";
-            send(fd, err, strlen(err), 0);
+            snprintf(response, sizeof(response), "ERR Usage: /join <name> <room>\n");
+            send(fd, response, strlen(response), 0);
             return;
         }
-        strncpy(nicknames[fd], name, MAXNAME-1);
-        nicknames[fd][MAXNAME-1] = '\0';
-        strncpy(rooms[fd], room, MAXROOM-1);
-        rooms[fd][MAXROOM-1] = '\0';
-        registered[fd] = 1;
+        strncpy(cli->nickname, name, MAXNAME - 1);
+        strncpy(cli->room, room, MAXROOM - 1);
+        cli->registered = 1;
 
-        snprintf(buf, sizeof(buf),
-                 "OK Joined as %s in room %s\n",
-                 nicknames[fd], rooms[fd]);
-        send(fd, buf, strlen(buf), 0);
-
-        printf("SERVER: fd=%d joined name=%s room=%s\n",
-               fd, nicknames[fd], rooms[fd]);
+        printf("SERVER: fd=%d joined. Nick=%s, Room=%s\n", fd, cli->nickname, cli->room);
+        snprintf(response, sizeof(response), "OK Joined as %s in room %s\n", cli->nickname, cli->room);
+        send(fd, response, strlen(response), 0);
     }
-    // /msg <message>
+    // 2. /msg <message>
     else if (strncmp(line, "/msg", 4) == 0) {
-        if (!registered[fd]) {
-            const char *err = "ERR Please /join first.\n";
-            send(fd, err, strlen(err), 0);
+        if (!cli->registered) {
+            send(fd, "ERR Please /join first.\n", 24, 0);
             return;
         }
         char *msg = line + 4;
-        while (*msg == ' ') msg++;   // 앞 공백 제거
+        while (*msg == ' ') msg++; // 공백 제거
 
-        if (*msg == '\0') {
-            const char *err = "ERR Usage: /msg <message>\n";
-            send(fd, err, strlen(err), 0);
-            return;
-        }
-
-        // 같은 방에 있는 사용자에게 브로드캐스트 (보낸 사람 포함)
-        char out[MAXBUF];
-        snprintf(out, sizeof(out),
-                 "[room %s][%s] %s\n",
-                 rooms[fd], nicknames[fd], msg);
-
-        for (int j = 0; j < FD_SETSIZE; j++) {
-            if (!FD_ISSET(j, activefds)) continue;
-            if (!registered[j]) continue;
-            if (strcmp(rooms[j], rooms[fd]) != 0) continue;
-
-            if (send(j, out, strlen(out), 0) == -1) {
-                perror("send");
-            }
-        }
+        char packet[MAXBUF];
+        snprintf(packet, sizeof(packet), "[%s] %s\n", cli->nickname, msg);
+        broadcast_to_room(server, idx, packet, strlen(packet));
     }
-    // /file <filename> <size>
+    // 3. /file <filename> <size>
     else if (strncmp(line, "/file", 5) == 0) {
-        if (!registered[fd]) {
-            const char *err = "ERR Please /join first.\n";
-            send(fd, err, strlen(err), 0);
+        if (!cli->registered) {
+            send(fd, "ERR Please /join first.\n", 24, 0);
+            return;
+        }
+        char fname[256];
+        long fsize = 0;
+        if (sscanf(line, "/file %255s %ld", fname, &fsize) != 2 || fsize <= 0) {
+            send(fd, "ERR Usage: /file <name> <size>\n", 31, 0);
             return;
         }
 
-        char filename[256];
-        long size = 0;
-        if (sscanf(line, "/file %255s %ld", filename, &size) != 2 || size <= 0) {
-            const char *err = "ERR Usage: /file <filename> <size>\n";
-            send(fd, err, strlen(err), 0);
-            return;
-        }
+        // 상태 전환: 파일 데이터 수신 모드
+        cli->file_remain = fsize;
 
-        // 앞으로 이 fd에서 size 바이트만큼 파일 데이터가 올 것이다
-        file_remain[fd] = size;
-
-        // 같은 방의 모든 클라이언트에게 파일 수신 헤더 전송
-        // 형식: FILE <보낸닉> <파일이름> <크기>
+        // 같은 방 사람들에게 파일 수신 알림 (헤더 전송)
         char header[MAXBUF];
-        snprintf(header, sizeof(header),
-                 "FILE %s %s %ld\n",
-                 nicknames[fd], filename, size);
+        snprintf(header, sizeof(header), "FILE %s %s %ld\n", cli->nickname, fname, fsize);
+        broadcast_to_room(server, idx, header, strlen(header));
 
-        for (int j = 0; j < FD_SETSIZE; j++) {
-            if (!FD_ISSET(j, activefds)) continue;
-            if (!registered[j]) continue;
-            if (strcmp(rooms[j], rooms[fd]) != 0) continue;
-
-            if (send(j, header, strlen(header), 0) == -1) {
-                perror("send header");
-            }
-        }
-
-        printf("SERVER: fd=%d sending file '%s' (%ld bytes) to room %s\n",
-               fd, filename, size, rooms[fd]);
-        // 실제 파일 데이터는 다음 recv()에서 처리
+        printf("SERVER: fd=%d started file transfer '%s' (%ld bytes)\n", fd, fname, fsize);
     }
     else {
-        const char *err = "ERR Unknown command. Use /join, /msg, /file.\n";
-        send(fd, err, strlen(err), 0);
+        send(fd, "ERR Unknown command\n", 20, 0);
     }
 }
 
-int main(void)
-{
-    setlocale(LC_ALL, "");
-
-    int listenfd, newfd;
-    struct sockaddr_in serv_addr, cli_addr;
-    socklen_t addrlen;
-    fd_set activefds, readfds;
-    int maxfd, i, nbytes;
+/* 수신된 데이터 처리 (버퍼링 및 파싱) */
+void handle_client_data(ServerContext *server, int idx) {
+    ClientContext *cli = &server->clients[idx];
     char buf[MAXBUF];
-
-    init_clients();
-
-    /* 1. 리슨 소켓 생성 */
-    if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("socket");
-        exit(1);
+    
+    // 1. 데이터 수신
+    ssize_t nbytes = recv(cli->fd, buf, sizeof(buf), 0);
+    if (nbytes <= 0) {
+        disconnect_client(server, idx);
+        return;
     }
 
-    /* SO_REUSEADDR 설정 (재실행 편하게) */
+    // 2. 파일 데이터 모드인 경우: 버퍼링 없이 즉시 브로드캐스트
+    if (cli->file_remain > 0) {
+        long to_send = (nbytes > cli->file_remain) ? cli->file_remain : nbytes;
+        
+        // 같은 방 인원에게 바이너리 데이터 전송
+        broadcast_to_room(server, idx, buf, to_send);
+        
+        cli->file_remain -= to_send;
+        if (cli->file_remain <= 0) {
+            printf("SERVER: fd=%d file transfer complete\n", cli->fd);
+        }
+        
+        // 파일 데이터 뒤에 붙어온 텍스트 명령어가 있다면? (복잡한 경우)
+        // 이 예제에서는 파일 데이터와 명령어가 정확히 분리된다고 가정하거나
+        // 남은 데이터를 버립니다. 실무에선 링버퍼가 필요합니다.
+        return; 
+    }
+
+    // 3. 일반 텍스트 모드: 버퍼에 쌓고 개행 문자 단위로 처리
+    // 버퍼 오버플로우 방지
+    if (cli->cmd_len + nbytes >= MAXBUF) {
+        // 버퍼가 꽉 찼다면 비우거나 에러 처리 (여기선 초기화)
+        cli->cmd_len = 0; 
+    }
+    
+    memcpy(cli->cmd_buf + cli->cmd_len, buf, nbytes);
+    cli->cmd_len += nbytes;
+    cli->cmd_buf[cli->cmd_len] = '\0'; // 안전장치
+
+    // 개행 문자(\n)가 있는지 확인하며 처리
+    char *p;
+    while ((p = strchr(cli->cmd_buf, '\n')) != NULL) {
+        *p = '\0'; // 개행을 null로 변경하여 문자열 분리
+        
+        // 캐리지 리턴(\r) 처리
+        if (p > cli->cmd_buf && *(p-1) == '\r') *(p-1) = '\0';
+
+        if (strlen(cli->cmd_buf) > 0) {
+            process_command(server, idx, cli->cmd_buf);
+        }
+
+        // 처리한 부분 제거하고 버퍼 앞으로 당기기 (memmove)
+        int processed_len = (p - cli->cmd_buf) + 1;
+        int remaining = cli->cmd_len - processed_len;
+        
+        memmove(cli->cmd_buf, cli->cmd_buf + processed_len, remaining);
+        cli->cmd_len = remaining;
+        cli->cmd_buf[cli->cmd_len] = '\0';
+    }
+}
+
+/* 새 연결 수락 */
+void handle_new_connection(ServerContext *server) {
+    struct sockaddr_in cli_addr;
+    socklen_t addrlen = sizeof(cli_addr);
+    int newfd = accept(server->listenfd, (struct sockaddr *)&cli_addr, &addrlen);
+    
+    if (newfd < 0) {
+        perror("accept");
+        return;
+    }
+
+    // 빈 슬롯 찾기
+    int idx = -1;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (server->clients[i].fd == -1) {
+            idx = i;
+            break;
+        }
+    }
+
+    if (idx == -1) {
+        printf("SERVER: Too many clients. Rejected.\n");
+        close(newfd);
+        return;
+    }
+
+    // 등록
+    init_client(&server->clients[idx]);
+    server->clients[idx].fd = newfd;
+    
+    FD_SET(newfd, &server->all_fds);
+    if (newfd > server->max_fd) server->max_fd = newfd;
+
+    printf("SERVER: New connection from %s, assigned fd=%d\n", 
+           inet_ntoa(cli_addr.sin_addr), newfd);
+}
+
+int main(void) {
+    setlocale(LC_ALL, "");
+    ServerContext server;
+    
+    // 초기화
+    memset(&server, 0, sizeof(server));
+    for (int i = 0; i < MAX_CLIENTS; i++) init_client(&server.clients[i]);
+    
+    // 소켓 생성
+    server.listenfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server.listenfd < 0) { perror("socket"); exit(1); }
+
     int yes = 1;
-    if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
-        perror("setsockopt");
-        exit(1);
-    }
+    setsockopt(server.listenfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-    /* 2. 주소 설정 */
+    struct sockaddr_in serv_addr;
     memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port   = htons(PORT);
+    serv_addr.sin_port = htons(PORT);
     serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    if (bind(listenfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("bind");
-        exit(1);
+    if (bind(server.listenfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        perror("bind"); exit(1);
     }
 
-    /* 3. listen */
-    if (listen(listenfd, QLEN) < 0) {
-        perror("listen");
-        exit(1);
+    if (listen(server.listenfd, 10) < 0) {
+        perror("listen"); exit(1);
     }
 
-    printf("SERVER: listening on port %d ...\n", PORT);
+    FD_ZERO(&server.all_fds);
+    FD_SET(server.listenfd, &server.all_fds);
+    server.max_fd = server.listenfd;
 
-    /* 4. fd_set 초기화 */
-    FD_ZERO(&activefds);
-    FD_SET(listenfd, &activefds);
-    maxfd = listenfd;
+    printf("SERVER: Running on port %d...\n", PORT);
 
-    /* 5. 메인 루프 */
     while (1) {
-        readfds = activefds;
-
-        if (select(maxfd + 1, &readfds, NULL, NULL, NULL) < 0) {
+        fd_set read_fds = server.all_fds;
+        
+        if (select(server.max_fd + 1, &read_fds, NULL, NULL, NULL) < 0) {
+            if (errno == EINTR) continue;
             perror("select");
-            exit(1);
+            break;
         }
 
-        for (i = 0; i <= maxfd; i++) {
-            if (!FD_ISSET(i, &readfds))
-                continue;
+        // 1. 새 연결 확인
+        if (FD_ISSET(server.listenfd, &read_fds)) {
+            handle_new_connection(&server);
+        }
 
-            /* 새 연결 */
-            if (i == listenfd) {
-                addrlen = sizeof(cli_addr);
-                newfd = accept(listenfd, (struct sockaddr *)&cli_addr, &addrlen);
-                if (newfd < 0) {
-                    perror("accept");
-                    continue;
-                }
-
-                printf("SERVER: new client %s, fd=%d\n",
-                       inet_ntoa(cli_addr.sin_addr), newfd);
-
-                FD_SET(newfd, &activefds);
-                if (newfd > maxfd)
-                    maxfd = newfd;
-
-                registered[newfd] = 0;
-                nicknames[newfd][0] = '\0';
-                rooms[newfd][0] = '\0';
-                file_remain[newfd] = 0;
-            }
-            /* 기존 클라이언트 */
-            else {
-                nbytes = recv(i, buf, sizeof(buf), 0);
-                if (nbytes <= 0) {
-                    if (nbytes == 0)
-                        printf("SERVER: client fd=%d disconnected\n", i);
-                    else
-                        perror("recv");
-
-                    close(i);
-                    FD_CLR(i, &activefds);
-                    registered[i] = 0;
-                    nicknames[i][0] = '\0';
-                    rooms[i][0] = '\0';
-                    file_remain[i] = 0;
-                } else {
-                    // 파일 데이터 모드인지 체크
-                    if (file_remain[i] > 0) {
-                        long to_forward = nbytes;
-                        if (to_forward > file_remain[i])
-                            to_forward = file_remain[i];
-
-                        // 같은 방의 사용자에게 그대로 전달
-                        for (int j = 0; j < FD_SETSIZE; j++) {
-                            if (!FD_ISSET(j, &activefds)) continue;
-                            if (!registered[j]) continue;
-                            if (strcmp(rooms[j], rooms[i]) != 0) continue;
-
-                            if (send(j, buf, to_forward, 0) == -1) {
-                                perror("send file data");
-                            }
-                        }
-
-                        file_remain[i] -= to_forward;
-                        if (file_remain[i] <= 0) {
-                            printf("SERVER: file transfer from fd=%d done\n", i);
-                        }
-                    } else {
-                        // 평상시 텍스트 명령 처리
-                        buf[nbytes] = '\0';
-                        handle_line(i, &activefds, buf);
-                    }
-                }
+        // 2. 기존 클라이언트 데이터 확인
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            int fd = server.clients[i].fd;
+            if (fd != -1 && fd != server.listenfd && FD_ISSET(fd, &read_fds)) {
+                handle_client_data(&server, i);
             }
         }
     }
 
-    close(listenfd);
+    close(server.listenfd);
     return 0;
 }
