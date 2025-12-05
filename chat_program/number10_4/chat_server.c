@@ -73,7 +73,7 @@ void broadcast_to_room(ServerContext *server, int sender_idx, const char *data, 
         if (target->fd == -1) continue; // 빈 슬롯
         if (!target->registered) continue; // 입장 전
         if (strcmp(target->room, sender->room) != 0) continue; // 다른 방
-
+        if (i == sender_idx) continue;
         // 자기 자신 및 다른 사람에게 전송 (send 실패 시 로그만)
         if (send(target->fd, data, len, 0) == -1) {
             perror("send broadcast");

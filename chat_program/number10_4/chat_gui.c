@@ -36,13 +36,20 @@ typedef struct {
     char recv_filename[256];
 } ChatApp;
 
-/* 채팅창에 텍스트 추가 (Helper 함수) */
+/* 채팅창에 텍스트 추가 (UTF-8 검증 포함) */
 static void append_chat_text(ChatApp *app, const char *msg)
 {
     GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(app->textview_chat));
     GtkTextIter end_iter;
     gtk_text_buffer_get_end_iter(buffer, &end_iter);
-    gtk_text_buffer_insert(buffer, &end_iter, msg, -1);
+    
+    // [수정] UTF-8 유효성 검사: 깨진 문자열이면 대체 텍스트 출력
+    if (g_utf8_validate(msg, -1, NULL)) {
+        gtk_text_buffer_insert(buffer, &end_iter, msg, -1);
+    } else {
+        gtk_text_buffer_insert(buffer, &end_iter, "[Binary Data or Invalid UTF-8]", -1);
+    }
+    
     gtk_text_buffer_insert(buffer, &end_iter, "\n", -1);
     
     /* 자동 스크롤 */
@@ -179,6 +186,11 @@ static void on_send_clicked(GtkWidget *widget, gpointer data)
         return;
     }
 
+    // [추가] 내 화면에 내가 쓴 글 표시
+    char my_msg[MAXBUF];
+    snprintf(my_msg, sizeof(my_msg), "[나] %s", text);
+    append_chat_text(app, my_msg);
+
     gtk_entry_set_text(GTK_ENTRY(app->entry_msg), "");
 }
 
@@ -233,9 +245,13 @@ static void on_file_clicked(GtkWidget *widget, gpointer data)
                 }
             }
 
+            // ========================================================
+            // [추가] 내 화면에 전송 완료 메시지 표시
+            // ========================================================
             char msg[512];
-            snprintf(msg, sizeof(msg), "** 파일 전송 완료: %s **", basename);
+            snprintf(msg, sizeof(msg), ">> [나] 파일 전송 완료: %s (%ld bytes)", basename, size);
             append_chat_text(app, msg);
+            // ========================================================
 
             fclose(fp);
             g_free(basename);
