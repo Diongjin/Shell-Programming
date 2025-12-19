@@ -52,20 +52,15 @@ int main(int argc, char *argv[])
            server_ip, PORT, nickname, room);
     printf("Type messages and press Enter. '/quit' to exit.\n");
 
-    /* --- 접속 직후 사용자 등록(/join) --- */
+    /* 접속 직후 /join 전송 */
     char joinmsg[MAXMSG];
     snprintf(joinmsg, sizeof(joinmsg), "/join %s %s\n", nickname, room);
-    if (send(sock, joinmsg, strlen(joinmsg), 0) == -1) {
-        perror("send /join");
-        close(sock);
-        exit(1);
-    }
+    send(sock, joinmsg, strlen(joinmsg), 0);
 
-    /* 4. 메인 루프: stdin + 소켓을 동시에 select로 감시 */
     while (1) {
         FD_ZERO(&readfds);
-        FD_SET(STDIN_FILENO, &readfds); // 키보드 입력
-        FD_SET(sock, &readfds);         // 서버 소켓
+        FD_SET(STDIN_FILENO, &readfds);
+        FD_SET(sock, &readfds);
 
         int maxfd = (sock > STDIN_FILENO ? sock : STDIN_FILENO);
 
@@ -74,40 +69,30 @@ int main(int argc, char *argv[])
             exit(1);
         }
 
-        /* 4-1. 키보드 입력이 있으면 서버로 전송 */
+        /* 키보드 입력 */
         if (FD_ISSET(STDIN_FILENO, &readfds)) {
-            if (fgets(sendbuf, sizeof(sendbuf), stdin) == NULL) {
-                printf("Input EOF, exiting.\n");
+            if (fgets(sendbuf, sizeof(sendbuf), stdin) == NULL)
+                break;
+
+            /* /quit 명령 서버로 전송 */
+            if (strncmp(sendbuf, "/quit", 5) == 0) {
+                send(sock, "/quit\n", 6, 0);
                 break;
             }
 
-            if (strncmp(sendbuf, "/quit", 5) == 0)
-                break;
-
-            // /msg <내용> 형태로 서버에 전송
             char msg[MAXMSG];
             snprintf(msg, sizeof(msg), "/msg %s", sendbuf);
-
-            if (send(sock, msg, strlen(msg), 0) == -1) {
-                perror("send");
-                break;
-            }
+            send(sock, msg, strlen(msg), 0);
         }
 
-        /* 4-2. 서버로부터 메시지 수신 */
+        /* 서버 메시지 수신 */
         if (FD_ISSET(sock, &readfds)) {
             int nbytes = recv(sock, recvbuf, sizeof(recvbuf) - 1, 0);
-            if (nbytes <= 0) {
-                if (nbytes == 0) {
-                    printf("Server closed connection.\n");
-                } else {
-                    perror("recv");
-                }
+            if (nbytes <= 0)
                 break;
-            }
+
             recvbuf[nbytes] = '\0';
             printf("%s", recvbuf);
-            fflush(stdout);
         }
     }
 
