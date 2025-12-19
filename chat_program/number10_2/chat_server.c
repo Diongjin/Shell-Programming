@@ -83,7 +83,7 @@ void handle_line(int fd, fd_set *activefds, char *line) {
         }
     }
 
-    /* ★ 최소 추가: /quit 처리 */
+    /* /quit 처리 */
     else if (strncmp(line, "/quit", 5) == 0) {
         if (registered[fd]) {
             char out[MAXBUF];
